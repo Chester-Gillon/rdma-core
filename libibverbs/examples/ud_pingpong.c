@@ -112,6 +112,19 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
 		ah_attr.grh.hop_limit = 1;
 		ah_attr.grh.dgid = dest->gid;
 		ah_attr.grh.sgid_index = sgid_idx;
+
+        int rc;
+        uint8_t eth_mac[ETHERNET_LL_SIZE];
+        uint16_t vid;
+
+        rc = ibv_resolve_eth_l2_from_gid (ctx->context, &ah_attr, eth_mac, &vid);
+        if (rc == 0) {
+            printf ("  eth_mac=%02X:%02X:%02X:%02X:%02X:%02X  vid=%u\n",
+                    eth_mac[0], eth_mac[1], eth_mac[2], eth_mac[3], eth_mac[4], eth_mac[5], vid);
+        }
+        else {
+            printf ("ibv_resolve_eth_l2_from_gid failed\n");
+        }
 	}
 
 	ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
