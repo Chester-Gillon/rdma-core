@@ -116,9 +116,9 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, enum ibv_mtu m
 				  IBV_QP_AV                 |
 				  IBV_QP_PATH_MTU           |
 				  IBV_QP_DEST_QPN           |
-				  IBV_QP_RQ_PSN             |
-				  IBV_QP_MAX_DEST_RD_ATOMIC |
-				  IBV_QP_MIN_RNR_TIMER)) {
+				  IBV_QP_RQ_PSN             /*|*/
+				  /*IBV_QP_MAX_DEST_RD_ATOMIC |*/
+				  /*IBV_QP_MIN_RNR_TIMER*/)) {
 			fprintf(stderr, "Failed to modify QP[%d] to RTR\n", i);
 			return 1;
 		}
@@ -131,11 +131,11 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, enum ibv_mtu m
 		attr.max_rd_atomic  = 1;
 		if (ibv_modify_qp(ctx->qp[i], &attr,
 				  IBV_QP_STATE              |
-				  IBV_QP_TIMEOUT            |
-				  IBV_QP_RETRY_CNT          |
-				  IBV_QP_RNR_RETRY          |
-				  IBV_QP_SQ_PSN             |
-				  IBV_QP_MAX_QP_RD_ATOMIC)) {
+				  /*IBV_QP_TIMEOUT            |*/
+				  /*IBV_QP_RETRY_CNT          |*/
+				  /*IBV_QP_RNR_RETRY          |*/
+				  IBV_QP_SQ_PSN             /*|*/
+				  /*IBV_QP_MAX_QP_RD_ATOMIC*/)) {
 			fprintf(stderr, "Failed to modify QP[%d] to RTS\n", i);
 			return 1;
 		}
@@ -449,7 +449,7 @@ static struct pingpong_context *pp_init_ctx(struct ibv_device *ib_dev, int size,
 				.max_send_wr  = 1,
 				.max_send_sge = 1,
 			},
-			.qp_type = IBV_QPT_RC
+			.qp_type = IBV_QPT_UC /* IBV_QPT_RC */
 		};
 
 		ctx->qp[i] = ibv_create_qp(ctx->pd, &init_attr);
