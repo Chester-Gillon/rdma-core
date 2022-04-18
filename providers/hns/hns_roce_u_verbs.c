@@ -40,7 +40,6 @@
 #include <ccan/minmax.h>
 #include "hns_roce_u.h"
 #include "hns_roce_u_db.h"
-#include "hns_roce_u_hw_v1.h"
 #include "hns_roce_u_hw_v2.h"
 
 void hns_roce_init_qp_indices(struct hns_roce_qp *qp)
@@ -221,18 +220,6 @@ int hns_roce_u_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 	struct ibv_send_wr wr = {};
 	int ret;
 
-	if (!bind_info->mr && bind_info->length)
-		return EINVAL;
-
-	if (mw->pd != qp->pd)
-		return EINVAL;
-
-	if (bind_info->mr && (mw->pd != bind_info->mr->pd))
-		return EINVAL;
-
-	if (mw->type != IBV_MW_TYPE_1)
-		return EINVAL;
-
 	if (bind_info->mw_access_flags & ~(IBV_ACCESS_REMOTE_WRITE |
 	    IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC))
 		return EINVAL;
@@ -288,12 +275,25 @@ int hns_roce_u_dealloc_mw(struct ibv_mw *mw)
 	return 0;
 }
 
-static int hns_roce_verify_cq(int *cqe, struct hns_roce_context *context)
+enum {
+	CREATE_CQ_SUPPORTED_WC_FLAGS = IBV_WC_STANDARD_FLAGS |
+				       IBV_WC_EX_WITH_CVLAN,
+};
+
+static int verify_cq_create_attr(struct ibv_cq_init_attr_ex *attr,
+				 struct hns_roce_context *context)
 {
-	if (*cqe < 1 || *cqe > context->max_cqe)
+	if (!attr->cqe || attr->cqe > context->max_cqe)
 		return -EINVAL;
 
-	*cqe = max((uint64_t)HNS_ROCE_MIN_CQE_NUM, roundup_pow_of_two(*cqe));
+	if (attr->comp_mask)
+		return -EOPNOTSUPP;
+
+	if (!check_comp_mask(attr->wc_flags, CREATE_CQ_SUPPORTED_WC_FLAGS))
+		return -EOPNOTSUPP;
+
+	attr->cqe = max_t(uint32_t, HNS_ROCE_MIN_CQE_NUM,
+			  roundup_pow_of_two(attr->cqe));
 
 	return 0;
 }
@@ -309,25 +309,25 @@ static int hns_roce_alloc_cq_buf(struct hns_roce_cq *cq)
 }
 
 static int exec_cq_create_cmd(struct ibv_context *context,
-			      struct hns_roce_cq *cq, int cqe,
-			      struct ibv_comp_channel *channel, int comp_vector)
+			      struct hns_roce_cq *cq,
+			      struct ibv_cq_init_attr_ex *attr)
 {
+	struct hns_roce_create_cq_ex_resp resp_ex = {};
 	struct hns_roce_ib_create_cq_resp *resp_drv;
-	struct hns_roce_create_cq_resp resp = {};
+	struct hns_roce_create_cq_ex cmd_ex = {};
 	struct hns_roce_ib_create_cq *cmd_drv;
-	struct hns_roce_create_cq cmd = {};
 	int ret;
 
-	cmd_drv = &cmd.drv_payload;
-	resp_drv = &resp.drv_payload;
+	cmd_drv = &cmd_ex.drv_payload;
+	resp_drv = &resp_ex.drv_payload;
 
 	cmd_drv->buf_addr = (uintptr_t)cq->buf.buf;
 	cmd_drv->db_addr = (uintptr_t)cq->db;
 	cmd_drv->cqe_size = (uintptr_t)cq->cqe_size;
 
-	ret = ibv_cmd_create_cq(context, cqe, channel, comp_vector,
-				&cq->ibv_cq, &cmd.ibv_cmd, sizeof(cmd),
-				&resp.ibv_resp, sizeof(resp));
+	ret = ibv_cmd_create_cq_ex(context, attr, &cq->verbs_cq,
+				   &cmd_ex.ibv_cmd, sizeof(cmd_ex),
+				   &resp_ex.ibv_resp, sizeof(resp_ex), 0);
 	if (ret)
 		return ret;
 
@@ -337,16 +337,14 @@ static int exec_cq_create_cmd(struct ibv_context *context,
 	return 0;
 }
 
-struct ibv_cq *hns_roce_u_create_cq(struct ibv_context *context, int cqe,
-				    struct ibv_comp_channel *channel,
-				    int comp_vector)
+static struct ibv_cq_ex *create_cq(struct ibv_context *context,
+			 struct ibv_cq_init_attr_ex *attr)
 {
-	struct hns_roce_device *hr_dev = to_hr_dev(context->device);
 	struct hns_roce_context *hr_ctx = to_hr_ctx(context);
 	struct hns_roce_cq *cq;
 	int ret;
 
-	ret = hns_roce_verify_cq(&cqe, hr_ctx);
+	ret = verify_cq_create_attr(attr, hr_ctx);
 	if (ret)
 		goto err;
 
@@ -360,7 +358,7 @@ struct ibv_cq *hns_roce_u_create_cq(struct ibv_context *context, int cqe,
 	if (ret)
 		goto err_lock;
 
-	cq->cq_depth = cqe;
+	cq->cq_depth = attr->cqe;
 	cq->cqe_size = hr_ctx->cqe_size;
 
 	ret = hns_roce_alloc_cq_buf(cq);
@@ -375,17 +373,16 @@ struct ibv_cq *hns_roce_u_create_cq(struct ibv_context *context, int cqe,
 
 	*cq->db = 0;
 
-	ret = exec_cq_create_cmd(context, cq, cqe, channel, comp_vector);
+	ret = exec_cq_create_cmd(context, cq, attr);
 	if (ret)
 		goto err_cmd;
 
 	cq->arm_sn = 1;
 
-	return &cq->ibv_cq;
+	return &cq->verbs_cq.cq_ex;
 
 err_cmd:
-	if (hr_dev->hw_version != HNS_ROCE_HW_VER1)
-		hns_roce_free_db(hr_ctx, cq->db, HNS_ROCE_CQ_TYPE_DB);
+	hns_roce_free_db(hr_ctx, cq->db, HNS_ROCE_CQ_TYPE_DB);
 err_db:
 	hns_roce_free_buf(&cq->buf);
 err_lock:
@@ -397,6 +394,33 @@ err:
 
 	errno = ret;
 	return NULL;
+}
+
+struct ibv_cq *hns_roce_u_create_cq(struct ibv_context *context, int cqe,
+				    struct ibv_comp_channel *channel,
+				    int comp_vector)
+{
+	struct ibv_cq_ex *cq;
+	struct ibv_cq_init_attr_ex attr = {
+		.cqe = cqe,
+		.channel = channel,
+		.comp_vector = comp_vector,
+	};
+
+	cq = create_cq(context, &attr);
+	return cq ? ibv_cq_ex_to_cq(cq) : NULL;
+}
+
+struct ibv_cq_ex *hns_roce_u_create_cq_ex(struct ibv_context *context,
+					  struct ibv_cq_init_attr_ex *attr)
+{
+	struct ibv_cq_ex *cq;
+
+	cq = create_cq(context, attr);
+	if (cq)
+		hns_roce_attach_cq_ex_ops(cq, attr->wc_flags);
+
+	return cq;
 }
 
 void hns_roce_u_cq_event(struct ibv_cq *cq)
@@ -419,9 +443,8 @@ int hns_roce_u_destroy_cq(struct ibv_cq *cq)
 	if (ret)
 		return ret;
 
-	if (to_hr_dev(cq->context->device)->hw_version != HNS_ROCE_HW_VER1)
-		hns_roce_free_db(to_hr_ctx(cq->context), to_hr_cq(cq)->db,
-				 HNS_ROCE_CQ_TYPE_DB);
+	hns_roce_free_db(to_hr_ctx(cq->context), to_hr_cq(cq)->db,
+				   HNS_ROCE_CQ_TYPE_DB);
 	hns_roce_free_buf(&to_hr_cq(cq)->buf);
 	free(to_hr_cq(cq));
 
@@ -431,8 +454,7 @@ int hns_roce_u_destroy_cq(struct ibv_cq *cq)
 static int hns_roce_store_srq(struct hns_roce_context *ctx,
 			      struct hns_roce_srq *srq)
 {
-	uint32_t tind = (srq->srqn & (ctx->num_srqs - 1)) >>
-			ctx->srq_table_shift;
+	uint32_t tind = to_hr_srq_table_index(srq->srqn, ctx);
 
 	pthread_mutex_lock(&ctx->srq_table_mutex);
 
@@ -457,7 +479,7 @@ static int hns_roce_store_srq(struct hns_roce_context *ctx,
 struct hns_roce_srq *hns_roce_find_srq(struct hns_roce_context *ctx,
 				       uint32_t srqn)
 {
-	uint32_t tind = (srqn & (ctx->num_srqs - 1)) >> ctx->srq_table_shift;
+	uint32_t tind = to_hr_srq_table_index(srqn, ctx);
 
 	if (ctx->srq_table[tind].refcnt)
 		return ctx->srq_table[tind].table[srqn & ctx->srq_table_mask];
@@ -467,7 +489,7 @@ struct hns_roce_srq *hns_roce_find_srq(struct hns_roce_context *ctx,
 
 static void hns_roce_clear_srq(struct hns_roce_context *ctx, uint32_t srqn)
 {
-	uint32_t tind = (srqn & (ctx->num_srqs - 1)) >> ctx->srq_table_shift;
+	uint32_t tind = to_hr_srq_table_index(srqn, ctx);
 
 	pthread_mutex_lock(&ctx->srq_table_mutex);
 
@@ -742,7 +764,8 @@ int hns_roce_u_destroy_srq(struct ibv_srq *ibv_srq)
 }
 
 enum {
-	CREATE_QP_SUP_COMP_MASK = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_XRCD,
+	CREATE_QP_SUP_COMP_MASK = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_XRCD |
+				  IBV_QP_INIT_ATTR_SEND_OPS_FLAGS,
 };
 
 static int check_qp_create_mask(struct hns_roce_context *ctx,
@@ -755,7 +778,7 @@ static int check_qp_create_mask(struct hns_roce_context *ctx,
 
 	switch (attr->qp_type) {
 	case IBV_QPT_UD:
-		if (hr_dev->hw_version < HNS_ROCE_HW_VER3)
+		if (hr_dev->hw_version == HNS_ROCE_HW_VER2)
 			return -EINVAL;
 		SWITCH_FALLTHROUGH;
 	case IBV_QPT_RC:
@@ -786,7 +809,6 @@ static int hns_roce_qp_has_rq(struct ibv_qp_init_attr_ex *attr)
 static int verify_qp_create_cap(struct hns_roce_context *ctx,
 				struct ibv_qp_init_attr_ex *attr)
 {
-	struct hns_roce_device *hr_dev = to_hr_dev(ctx->ibv_ctx.context.device);
 	struct ibv_qp_cap *cap = &attr->cap;
 	uint32_t min_wqe_num;
 	int has_rq;
@@ -806,9 +828,7 @@ static int verify_qp_create_cap(struct hns_roce_context *ctx,
 		cap->max_recv_sge = 0;
 	}
 
-	min_wqe_num = hr_dev->hw_version == HNS_ROCE_HW_VER1 ?
-		      HNS_ROCE_V1_MIN_WQE_NUM : HNS_ROCE_V2_MIN_WQE_NUM;
-
+	min_wqe_num = HNS_ROCE_V2_MIN_WQE_NUM;
 	if (cap->max_send_wr < min_wqe_num)
 		cap->max_send_wr = min_wqe_num;
 
@@ -878,17 +898,9 @@ static void qp_free_recv_inl_buf(struct hns_roce_qp *qp)
 static int calc_qp_buff_size(struct hns_roce_device *hr_dev,
 			     struct hns_roce_qp *qp)
 {
-	struct hns_roce_wq *sq, *rq;
+	struct hns_roce_wq *sq = &qp->sq;
+	struct hns_roce_wq *rq = &qp->rq;
 	unsigned int size;
-
-	if (hr_dev->hw_version == HNS_ROCE_HW_VER1 &&
-	    qp->rq.wqe_shift > qp->sq.wqe_shift) {
-		sq = &qp->rq;
-		rq = &qp->sq;
-	} else {
-		sq = &qp->sq;
-		rq = &qp->rq;
-	}
 
 	qp->buf_size = 0;
 
@@ -986,11 +998,6 @@ static void set_ext_sge_param(struct hns_roce_device *hr_dev,
 
 	qp->ex_sge.sge_shift = HNS_ROCE_SGE_SHIFT;
 
-	if (hr_dev->hw_version == HNS_ROCE_HW_VER1) {
-		qp->sq.max_gs = HNS_ROCE_SGE_IN_WQE;
-		return;
-	}
-
 	qp->sq.max_gs = attr->cap.max_send_sge;
 
 	wqe_sge_cnt = get_wqe_ext_sge_cnt(qp);
@@ -1021,28 +1028,18 @@ static void hns_roce_set_qp_params(struct ibv_qp_init_attr_ex *attr,
 
 		qp->rq.max_gs = roundup_pow_of_two(attr->cap.max_recv_sge +
 						   qp->rq.rsv_sge);
-		if (hr_dev->hw_version == HNS_ROCE_HW_VER1)
-			qp->rq.wqe_shift =
-				hr_ilog32(sizeof(struct hns_roce_rc_rq_wqe));
-		else
-			qp->rq.wqe_shift =
-				hr_ilog32(HNS_ROCE_SGE_SIZE * qp->rq.max_gs);
-
+		qp->rq.wqe_shift = hr_ilog32(HNS_ROCE_SGE_SIZE * qp->rq.max_gs);
 		cnt = roundup_pow_of_two(attr->cap.max_recv_wr);
 		qp->rq.wqe_cnt = cnt;
 		qp->rq.shift = hr_ilog32(cnt);
-		if (hr_dev->hw_version == HNS_ROCE_HW_VER1)
-			qp->rq_rinl_buf.wqe_cnt = 0;
-		else
-			qp->rq_rinl_buf.wqe_cnt = cnt;
+		qp->rq_rinl_buf.wqe_cnt = cnt;
 
 		attr->cap.max_recv_wr = qp->rq.wqe_cnt;
 		attr->cap.max_recv_sge = qp->rq.max_gs;
 	}
 
 	if (attr->cap.max_send_wr) {
-		qp->sq.wqe_shift =
-			hr_ilog32(sizeof(struct hns_roce_rc_send_wqe));
+		qp->sq.wqe_shift = HNS_ROCE_SQWQE_SHIFT;
 		cnt = roundup_pow_of_two(attr->cap.max_send_wr);
 		qp->sq.wqe_cnt = cnt;
 		qp->sq.shift = hr_ilog32(cnt);
@@ -1060,11 +1057,6 @@ static void hns_roce_set_qp_params(struct ibv_qp_init_attr_ex *attr,
 
 static void qp_free_db(struct hns_roce_qp *qp, struct hns_roce_context *ctx)
 {
-	struct hns_roce_device *hr_dev = to_hr_dev(ctx->ibv_ctx.context.device);
-
-	if (hr_dev->hw_version == HNS_ROCE_HW_VER1)
-		return;
-
 	if (qp->sdb)
 		hns_roce_free_db(ctx, qp->sdb, HNS_ROCE_QP_TYPE_DB);
 
@@ -1075,11 +1067,6 @@ static void qp_free_db(struct hns_roce_qp *qp, struct hns_roce_context *ctx)
 static int qp_alloc_db(struct ibv_qp_init_attr_ex *attr, struct hns_roce_qp *qp,
 		       struct hns_roce_context *ctx)
 {
-	struct hns_roce_device *hr_dev = to_hr_dev(ctx->ibv_ctx.context.device);
-
-	if (hr_dev->hw_version == HNS_ROCE_HW_VER1)
-		return 0;
-
 	if (attr->cap.max_send_wr) {
 		qp->sdb = hns_roce_alloc_db(ctx, HNS_ROCE_QP_TYPE_DB);
 		if (!qp->sdb)
@@ -1108,7 +1095,7 @@ static int hns_roce_store_qp(struct hns_roce_context *ctx,
 			     struct hns_roce_qp *qp)
 {
 	uint32_t qpn = qp->verbs_qp.qp.qp_num;
-	uint32_t tind = (qpn & (ctx->num_qps - 1)) >> ctx->qp_table_shift;
+	uint32_t tind = to_hr_qp_table_index(qpn, ctx);
 
 	pthread_mutex_lock(&ctx->qp_table_mutex);
 	if (!ctx->qp_table[tind].refcnt) {
@@ -1244,9 +1231,13 @@ static struct ibv_qp *create_qp(struct ibv_context *ibv_ctx,
 	if (ret)
 		goto err_cmd;
 
+	ret = hns_roce_attach_qp_ex_ops(attr, qp);
+	if (ret)
+		goto err_ops;
+
 	ret = hns_roce_store_qp(context, qp);
 	if (ret)
-		goto err_store;
+		goto err_ops;
 
 	if (qp->flags & HNS_ROCE_QP_CAP_DIRECT_WQE) {
 		ret = mmap_dwqe(ibv_ctx, qp, dwqe_mmap_key);
@@ -1260,7 +1251,7 @@ static struct ibv_qp *create_qp(struct ibv_context *ibv_ctx,
 
 err_dwqe:
 	hns_roce_v2_clear_qp(context, qp);
-err_store:
+err_ops:
 	ibv_cmd_destroy_qp(&qp->verbs_qp.qp);
 err_cmd:
 	hns_roce_free_qp_buf(qp, context);
@@ -1391,7 +1382,7 @@ struct ibv_ah *hns_roce_u_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 	struct hns_roce_ah *ah;
 
 	/* HIP08 don't support create ah */
-	if (hr_dev->hw_version < HNS_ROCE_HW_VER3)
+	if (hr_dev->hw_version == HNS_ROCE_HW_VER2)
 		return NULL;
 
 	ah = malloc(sizeof(*ah));

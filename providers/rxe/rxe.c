@@ -177,21 +177,9 @@ static int rxe_bind_mw(struct ibv_qp *ibqp, struct ibv_mw *ibmw,
 	struct ibv_send_wr ibwr;
 	struct ibv_send_wr *bad_wr;
 
-	if (!bind_info->mr && (bind_info->addr || bind_info->length)) {
-		ret = EINVAL;
-		goto err;
-	}
-
 	if (bind_info->mw_access_flags & IBV_ACCESS_ZERO_BASED) {
 		ret = EINVAL;
 		goto err;
-	}
-
-	if (bind_info->mr) {
-		if (ibmw->pd != bind_info->mr->pd) {
-			ret = EPERM;
-			goto err;
-		}
 	}
 
 	memset(&ibwr, 0, sizeof(ibwr));
@@ -695,12 +683,12 @@ static int rxe_post_one_recv(struct rxe_wq *rq, struct ibv_recv_wr *recv_wr)
 	int rc = 0;
 
 	if (queue_full(q)) {
-		rc  = -ENOMEM;
+		rc  = ENOMEM;
 		goto out;
 	}
 
 	if (recv_wr->num_sge > rq->max_sge) {
-		rc = -EINVAL;
+		rc = EINVAL;
 		goto out;
 	}
 
@@ -1620,6 +1608,10 @@ static int rxe_post_recv(struct ibv_qp *ibqp,
 	*bad_wr = NULL;
 
 	if (!rq || !recv_wr || !rq->queue)
+		return EINVAL;
+
+	/* see C10-97.2.1 */
+	if (ibqp->state == IBV_QPS_RESET)
 		return EINVAL;
 
 	pthread_spin_lock(&rq->lock);
