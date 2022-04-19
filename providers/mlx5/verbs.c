@@ -3078,12 +3078,31 @@ int mlx5_modify_qp_rate_limit(struct ibv_qp *qp,
 	if (attr->comp_mask)
 		return EINVAL;
 
+/*
+ * The kernel mlx5_ib_query_device() function in drivers/infiniband/hw/mlx5/main.c sets the MLX5_IB_PP_SUPPORT_BURST flag
+ * when both the packet_pacing_burst_bound and packet_pacing_typical_size fields in the device MLX5_CAP_QOS
+ * capabilities are non-zero.
+ *
+ * A ConnectX-4 Lx with firmware 14.32.1010 was found to have the following reported in the device capabilities:
+ * - packet_pacing_burst_bound=1
+ * - packet_pacing_typical_size=0
+ *
+ * Which resulted in MLX5_IB_PP_SUPPORT_BURST not being set and the following commented out code failing with EINVAL.
+ *
+ * The kernel __mlx5_ib_modify_qp() function in drivers/infiniband/hw/mlx5/qp.c which modifies the Queue-Pair
+ * uses independent checks for allowing max_burst_sz and typical_pkt_sz to be configured:
+ * - max_burst_sz is allowed to be non-zero when the packet_pacing_burst_bound device capability is non-zero.
+ * - typical_pkt_sz is allowed to be non-zero when the packet_pacing_typical_size device capability is non-zero.
+ *
+ * Therefore the following was commented out to allow just the max_burst_sz to be set when using a ConnectX-4 Lx.
+ *
 	if ((attr->max_burst_sz ||
 	     attr->typical_pkt_sz) &&
 	    (!attr->rate_limit ||
 	     !(mctx->packet_pacing_caps.cap_flags &
 	       MLX5_IB_PP_SUPPORT_BURST)))
 		return EINVAL;
+*/
 
 	cmd.burst_info.max_burst_sz = attr->max_burst_sz;
 	cmd.burst_info.typical_pkt_sz = attr->typical_pkt_sz;
