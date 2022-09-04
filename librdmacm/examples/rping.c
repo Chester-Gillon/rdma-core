@@ -34,6 +34,7 @@
 #include <endian.h>
 #include <getopt.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -44,6 +45,8 @@
 #include <pthread.h>
 #include <inttypes.h>
 #include <rdma/rdma_cma.h>
+#include <arpa/inet.h>
+#include <time.h>
 #include "common.h"
 
 static int debug = 0;
@@ -157,6 +160,18 @@ struct rping_cb {
 					/* listener on service side. */
 	struct rdma_cm_id *child_cm_id;	/* connection on server side */
 };
+
+/*
+ * @brief Return a monotonic time in integer nanoseconds
+ */
+static int64_t rping_get_monotonic_time (void)
+{
+    struct timespec now;
+
+    clock_gettime (CLOCK_MONOTONIC, &now);
+
+    return (now.tv_sec * 1000000000LL) + now.tv_nsec;
+}
 
 static int rping_cma_event_handler(struct rdma_cm_id *cma_id,
 				    struct rdma_cm_event *event)
@@ -425,6 +440,30 @@ static int rping_accept(struct rping_cb *cb)
 		fprintf(stderr, "wait for CONNECTED state %d\n", cb->state);
 		return -1;
 	}
+
+    struct sockaddr *const peer_addr = rdma_get_peer_addr (cb->child_cm_id);
+    if (peer_addr != NULL)
+    {
+        char addr_string[INET6_ADDRSTRLEN];
+        const char *ntop_status = NULL;
+
+        if (peer_addr->sa_family == AF_INET)
+        {
+            const struct sockaddr_in *const sock_addr = (const struct sockaddr_in *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin_family, &sock_addr->sin_addr, addr_string, sizeof (addr_string));
+        }
+        else
+        {
+            const struct sockaddr_in6 *const sock_addr = (const struct sockaddr_in6 *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin6_family, &sock_addr->sin6_addr, addr_string, sizeof (addr_string));
+        }
+
+        if (ntop_status != NULL)
+        {
+            printf ("Server accepted connection from peer address %s src port %u dst port %u\n",
+                    addr_string, ntohs (rdma_get_src_port (cb->child_cm_id)), ntohs (rdma_get_dst_port (cb->child_cm_id)));
+        }
+    }
 	return 0;
 }
 
@@ -841,6 +880,30 @@ static int rping_bind_server(struct rping_cb *cb)
 	}
 	DEBUG_LOG("rdma_bind_addr successful\n");
 
+	struct sockaddr *const local_addr = rdma_get_local_addr (cb->cm_id);
+	if (local_addr != NULL)
+	{
+	    char addr_string[INET6_ADDRSTRLEN];
+	    const char *ntop_status = NULL;
+
+	    if (local_addr->sa_family == AF_INET)
+	    {
+	        const struct sockaddr_in *const sock_addr = (const struct sockaddr_in *) local_addr;
+            ntop_status = inet_ntop (sock_addr->sin_family, &sock_addr->sin_addr, addr_string, sizeof (addr_string));
+	    }
+	    else
+	    {
+            const struct sockaddr_in6 *const sock_addr = (const struct sockaddr_in6 *) local_addr;
+            ntop_status = inet_ntop (sock_addr->sin6_family, &sock_addr->sin6_addr, addr_string, sizeof (addr_string));
+	    }
+
+	    if (ntop_status != NULL)
+	    {
+	        printf ("Server bound to local address %s src port %u dst port %u\n",
+	                addr_string, ntohs (rdma_get_src_port (cb->cm_id)), ntohs (rdma_get_dst_port (cb->cm_id)));
+	    }
+	}
+
 	DEBUG_LOG("rdma_listen\n");
 	ret = rdma_listen(cb->cm_id, 3);
 	if (ret) {
@@ -1109,6 +1172,7 @@ static int rping_connect_client(struct rping_cb *cb)
 	int ret;
 
 	rping_init_conn_param(cb, &conn_param);
+	const int64_t connect_start_time = rping_get_monotonic_time ();
 	ret = rdma_connect(cb->cm_id, &conn_param);
 	if (ret) {
 		perror("rdma_connect");
@@ -1116,10 +1180,36 @@ static int rping_connect_client(struct rping_cb *cb)
 	}
 
 	sem_wait(&cb->sem);
+    const int64_t connect_stop_time = rping_get_monotonic_time ();
 	if (cb->state != CONNECTED) {
 		fprintf(stderr, "wait for CONNECTED state %d\n", cb->state);
 		return -1;
 	}
+
+	printf ("rdma_connect took %.6lf seconds\n", ((double) (connect_stop_time - connect_start_time)) / 1E9);
+    struct sockaddr *const peer_addr = rdma_get_peer_addr (cb->cm_id);
+    if (peer_addr != NULL)
+    {
+        char addr_string[INET6_ADDRSTRLEN];
+        const char *ntop_status = NULL;
+
+        if (peer_addr->sa_family == AF_INET)
+        {
+            const struct sockaddr_in *const sock_addr = (const struct sockaddr_in *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin_family, &sock_addr->sin_addr, addr_string, sizeof (addr_string));
+        }
+        else
+        {
+            const struct sockaddr_in6 *const sock_addr = (const struct sockaddr_in6 *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin6_family, &sock_addr->sin6_addr, addr_string, sizeof (addr_string));
+        }
+
+        if (ntop_status != NULL)
+        {
+            printf ("Client connected to peer address %s src port %u dst port %u\n",
+                    addr_string, ntohs (rdma_get_src_port (cb->cm_id)), ntohs (rdma_get_dst_port (cb->cm_id)));
+        }
+    }
 
 	if (cb->self_create_qp) {
 		ret = rping_self_modify_qp(cb, cb->cm_id);
@@ -1167,6 +1257,54 @@ static int rping_bind_client(struct rping_cb *cb)
 	}
 
 	DEBUG_LOG("rdma_resolve_addr - rdma_resolve_route successful\n");
+
+    struct sockaddr *const local_addr = rdma_get_local_addr (cb->cm_id);
+    if (local_addr != NULL)
+    {
+        char addr_string[INET6_ADDRSTRLEN];
+        const char *ntop_status = NULL;
+
+        if (local_addr->sa_family == AF_INET)
+        {
+            const struct sockaddr_in *const sock_addr = (const struct sockaddr_in *) local_addr;
+            ntop_status = inet_ntop (sock_addr->sin_family, &sock_addr->sin_addr, addr_string, sizeof (addr_string));
+        }
+        else
+        {
+            const struct sockaddr_in6 *const sock_addr = (const struct sockaddr_in6 *) local_addr;
+            ntop_status = inet_ntop (sock_addr->sin6_family, &sock_addr->sin6_addr, addr_string, sizeof (addr_string));
+        }
+
+        if (ntop_status != NULL)
+        {
+            printf ("Client bound to local address %s src port %u dst port %u\n",
+                    addr_string, ntohs (rdma_get_src_port (cb->cm_id)), ntohs (rdma_get_dst_port (cb->cm_id)));
+        }
+    }
+
+    struct sockaddr *const peer_addr = rdma_get_peer_addr (cb->cm_id);
+    if (peer_addr != NULL)
+    {
+        char addr_string[INET6_ADDRSTRLEN];
+        const char *ntop_status = NULL;
+
+        if (peer_addr->sa_family == AF_INET)
+        {
+            const struct sockaddr_in *const sock_addr = (const struct sockaddr_in *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin_family, &sock_addr->sin_addr, addr_string, sizeof (addr_string));
+        }
+        else
+        {
+            const struct sockaddr_in6 *const sock_addr = (const struct sockaddr_in6 *) peer_addr;
+            ntop_status = inet_ntop (sock_addr->sin6_family, &sock_addr->sin6_addr, addr_string, sizeof (addr_string));
+        }
+
+        if (ntop_status != NULL)
+        {
+            printf ("Client bound to peer address %s src port %u dst port %u\n",
+                    addr_string, ntohs (rdma_get_src_port (cb->cm_id)), ntohs (rdma_get_dst_port (cb->cm_id)));
+        }
+    }
 	return 0;
 }
 
